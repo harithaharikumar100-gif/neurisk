@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.db
+neurisk/documents/*.pdf
+.venv/
+venv/
+*.sqlite3
+.streamlit/
+.vscode/
+.idea/
+*.log
