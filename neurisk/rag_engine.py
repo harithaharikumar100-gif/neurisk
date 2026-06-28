@@ -1,12 +1,14 @@
 """
 neurisk/rag_engine.py
 ─────────────────────
-NeuroRisk RAG engine — v6 (OpenRouter API + single-pass gap analysis)
+NeuroRisk RAG engine — v8 (Fixed: thread-safety, session_state in threads,
+                            st.error in threads, cache on main thread,
+                            company_name passed explicitly, retry logic)
 
 Setup:
   1. Get a free API key from https://openrouter.ai
   2. Add to .env file: OPENROUTER_API_KEY=your_key_here
-  3. pip install openai
+  3. pip install openai sentence-transformers
 
 Exposes:
   load_frameworks()         → dict[name, loaded_bool]
@@ -29,7 +31,7 @@ import time
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-load_dotenv()   
+load_dotenv()
 
 # ── OpenRouter config ─────────────────────────────────────────────────────────
 from openai import OpenAI
@@ -39,29 +41,58 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-OPENROUTER_MODEL = "openrouter/free"
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
 
-# Add to imports at top of rag_engine.py
+# ── Semantic embedding model ──────────────────────────────────────────────────
+# Loaded lazily on first use; cached at module level (not session state).
+# Uses all-MiniLM-L6-v2 (~80 MB) — runs fully locally, no API cost.
+_EMBED_MODEL_NAME  = "all-MiniLM-L6-v2"
+_EMBED_MODEL_CACHE = None   # None = not tried; False = tried and failed
 
 
+def _get_embed_model():
+    """Lazy-load the sentence transformer model into a module-level variable."""
+    global _EMBED_MODEL_CACHE
+    if _EMBED_MODEL_CACHE is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _EMBED_MODEL_CACHE = SentenceTransformer(_EMBED_MODEL_NAME)
+        except ImportError:
+            _EMBED_MODEL_CACHE = False
+    return _EMBED_MODEL_CACHE if _EMBED_MODEL_CACHE is not False else None
 
-def _check_api() -> bool:
-    """Check if OpenRouter API key is configured and working."""
-    if not os.getenv("OPENROUTER_API_KEY"):
-        return False
-    try:
-        client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[{"role": "user", "content": "test"}],
-            max_tokens=5,
-        )
-        return True
-    except Exception:
-        return False
 
+# ── Tuneable constants ────────────────────────────────────────────────────────
+CHUNK_SIZE        = 400
+CHUNK_OVERLAP     = 50
+TOP_K_CHUNKS      = 8
+MAX_CHUNK_CHARS   = 4000
+MAX_FW_WORDS      = 4000
+DOC_EXCERPT_WORDS = 3000
+
+
+# ── Framework definitions ─────────────────────────────────────────────────────
+FRAMEWORKS = {
+    "RBI AI Framework":     "rbi_ai_framework.pdf",
+    "NIST CSF":             "nist_csf.pdf",
+    "ISO 27001":            "iso_27001.pdf",
+    "Basel III":            "basel_3.pdf",
+    "DPDP Act":             "dpdp_act.pdf",
+    "RBI Master Direction": "rbi_master_direction.pdf",
+    "SEBI CSCRF":           "sebi_cscrf.pdf",
+    "Control Library":      "control_library.pdf",
+}
+
+DOCS_DIR = pathlib.Path(__file__).parent / "documents"
+DB_PATH  = pathlib.Path(__file__).parent / "neurisk_sessions.db"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _llm(prompt: str, system: str = "", max_tokens: int = 8192) -> str:
-    """Call OpenRouter and return raw text."""
+    """Call OpenRouter and return raw text. Safe to call from any thread."""
     if not os.getenv("OPENROUTER_API_KEY"):
         return "[LLM error: OPENROUTER_API_KEY not set in .env file]"
     try:
@@ -83,37 +114,41 @@ def _llm(prompt: str, system: str = "", max_tokens: int = 8192) -> str:
 def _llm_json(prompt: str,
               system: str = "",
               max_tokens: int = 8192,
-              retries: int = 2) -> dict | list | None:
-    last_raw = ""
+              retries: int = 1) -> dict | list | None:
+    """
+    Call LLM and parse JSON from the response.
+    On retry, re-sends the original prompt with an explicit JSON-only instruction
+    appended, rather than sending a separate correction call that lacks context.
+    Safe to call from any thread — no st.* calls inside.
+    """
+    json_suffix = (
+        "\n\nCRITICAL: Your response MUST be valid JSON only. "
+        "Start with { and end with }. "
+        "No markdown fences, no preamble, no explanation whatsoever."
+    )
+
     for attempt in range(retries + 1):
         if attempt > 0:
-            time.sleep(2 * attempt)   # wait 2s, then 4s, etc. before retrying
-
-        if attempt == 0:
-            raw = _llm(prompt, system, max_tokens)
+            time.sleep(2 * attempt)
+            # Re-send original prompt with a stronger JSON instruction
+            current_prompt = prompt + json_suffix
         else:
-            correction_prompt = (
-                f"Your previous response was not valid JSON.\n\n"
-                f"Previous response:\n{last_raw}\n\n"
-                f"Return ONLY the corrected JSON object. "
-                f"Start your response with {{ and end with }}. "
-                f"No explanation, no markdown, no extra text whatsoever."
-            )
-            raw = _llm(correction_prompt, system, max_tokens)
-        # ...rest unchanged raw = _llm(correction_prompt, system, max_tokens)
+            current_prompt = prompt
 
-        last_raw = raw
+        raw = _llm(current_prompt, system, max_tokens)
 
         if raw.startswith("[LLM error"):
             continue
 
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
 
+        # Try direct parse
         try:
             return json.loads(clean)
         except Exception:
             pass
 
+        # Try extracting {...}
         try:
             start = clean.index("{")
             end   = clean.rindex("}") + 1
@@ -121,6 +156,7 @@ def _llm_json(prompt: str,
         except Exception:
             pass
 
+        # Try extracting [...]
         try:
             start = clean.index("[")
             end   = clean.rindex("]") + 1
@@ -129,29 +165,6 @@ def _llm_json(prompt: str,
             pass
 
     return None
-
-
-# ── Framework definitions ─────────────────────────────────────────────────────
-FRAMEWORKS = {
-    "RBI AI Framework":     "rbi_ai_framework.pdf",
-    "NIST CSF":             "nist_csf.pdf",
-    "ISO 27001":            "iso_27001.pdf",
-    "Basel III":            "basel_3.pdf",
-    "DPDP Act":             "dpdp_act.pdf",
-    "RBI Master Direction": "rbi_master_direction.pdf",
-    "SEBI CSCRF":           "sebi_cscrf.pdf",
-    "Control Library":      "control_library.pdf",
-}
-
-DOCS_DIR = pathlib.Path(__file__).parent / "documents"
-DB_PATH  = pathlib.Path(__file__).parent / "neurisk_sessions.db"
-
-CHUNK_SIZE        = 400
-CHUNK_OVERLAP     = 50
-TOP_K_CHUNKS      = 6
-MAX_CHUNK_CHARS   = 3000
-MAX_FW_WORDS      = 2000
-DOC_EXCERPT_WORDS = 1500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -215,7 +228,7 @@ def extract_uploaded_file(uploaded_file) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHUNKING  (compliance_chat only)
+# CHUNKING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _chunk_text(text: str,
@@ -232,12 +245,33 @@ def _chunk_text(text: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TF-IDF RETRIEVAL  (compliance_chat only)
+# SEMANTIC RETRIEVAL
+# Falls back to TF-IDF if sentence-transformers is not installed.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _retrieve_chunks(query: str,
-                     chunks: list[str],
-                     top_k: int = TOP_K_CHUNKS) -> list[str]:
+def _retrieve_chunks_semantic(query: str,
+                               chunks: list[str],
+                               top_k: int = TOP_K_CHUNKS) -> list[str]:
+    """Semantic retrieval using sentence-transformers cosine similarity."""
+    try:
+        from sentence_transformers import util
+        model = _get_embed_model()
+        if model is None:
+            raise ImportError("model not loaded")
+
+        chunk_embs = model.encode(chunks, convert_to_tensor=True, show_progress_bar=False)
+        query_emb  = model.encode(query,  convert_to_tensor=True, show_progress_bar=False)
+        scores     = util.cos_sim(query_emb, chunk_embs)[0]
+        top_idx    = scores.topk(min(top_k, len(chunks))).indices.tolist()
+        return [chunks[i] for i in sorted(top_idx)]
+    except Exception:
+        return _retrieve_chunks_tfidf(query, chunks, top_k)
+
+
+def _retrieve_chunks_tfidf(query: str,
+                            chunks: list[str],
+                            top_k: int = TOP_K_CHUNKS) -> list[str]:
+    """TF-IDF fallback retrieval."""
     if not chunks:
         return []
     try:
@@ -254,9 +288,19 @@ def _retrieve_chunks(query: str,
         return chunks[:top_k]
 
 
+def _retrieve_chunks(query: str,
+                     chunks: list[str],
+                     top_k: int = TOP_K_CHUNKS) -> list[str]:
+    return _retrieve_chunks_semantic(query, chunks, top_k)
+
+
 def _retrieve_for_query(query: str,
                         fw_names: list[str] | None = None,
                         top_k: int = TOP_K_CHUNKS) -> str:
+    """
+    Retrieve relevant chunks for a query.
+    NOTE: reads from st.session_state — call only from the main thread.
+    """
     store        = _store()
     chunks_store = store["fw_chunks"]
     target       = fw_names if fw_names else list(chunks_store.keys())
@@ -274,11 +318,23 @@ def _retrieve_for_query(query: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SQLITE PERSISTENCE
+# SQLITE WITH WAL MODE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _get_conn() -> sqlite3.Connection:
+    """
+    Open a WAL-mode SQLite connection.
+    WAL allows concurrent readers + one writer — safe for ThreadPoolExecutor.
+    check_same_thread=False is required when the connection is used across threads.
+    """
+    con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
 def _init_db():
-    con = sqlite3.connect(str(DB_PATH))
+    con = _get_conn()
     con.executescript("""
         CREATE TABLE IF NOT EXISTS gap_results (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,17 +369,21 @@ def _init_db():
 
 
 def _session_id() -> str:
+    """
+    Get Streamlit session ID. Must be called from the main thread only.
+    Returns a fallback hash if not in a Streamlit context.
+    """
     try:
         return st.runtime.scriptrunner.get_script_run_ctx().session_id
     except Exception:
         return hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()[:12]
 
 
-def _save_gap_results(doc_name: str, results: list[dict]):
+def _save_gap_results(session_id: str, doc_name: str, results: list[dict]):
+    """Persist gap results to SQLite. Safe to call from any thread."""
     try:
         _init_db()
-        sid = _session_id()
-        con = sqlite3.connect(str(DB_PATH))
+        con = _get_conn()
         for r in results:
             con.execute("""
                 INSERT INTO gap_results
@@ -331,7 +391,7 @@ def _save_gap_results(doc_name: str, results: list[dict]):
                    matched, gaps, recommendation)
                 VALUES (?,?,?,?,?,?,?,?)
             """, [
-                sid,
+                session_id,
                 doc_name,
                 r.get("framework", ""),
                 r.get("status", ""),
@@ -351,7 +411,7 @@ def _save_doc_metadata(doc_name: str, text: str):
         _init_db()
         sid = _session_id()
         h   = hashlib.md5(text.encode()).hexdigest()[:12]
-        con = sqlite3.connect(str(DB_PATH))
+        con = _get_conn()
         con.execute("""
             INSERT INTO doc_registry (session_id, doc_name, char_count, doc_hash)
             VALUES (?,?,?,?)
@@ -366,7 +426,7 @@ def _save_doc_text(doc_name: str, text: str):
     try:
         _init_db()
         sid = _session_id()
-        con = sqlite3.connect(str(DB_PATH))
+        con = _get_conn()
         con.execute("""
             INSERT OR REPLACE INTO doc_texts (session_id, doc_name, text)
             VALUES (?, ?, ?)
@@ -378,10 +438,11 @@ def _save_doc_text(doc_name: str, text: str):
 
 
 def _load_persisted_docs():
+    """Load persisted docs from SQLite back into session state. Main thread only."""
     try:
         _init_db()
         sid  = _session_id()
-        con  = sqlite3.connect(str(DB_PATH))
+        con  = _get_conn()
         rows = con.execute("""
             SELECT doc_name, text FROM doc_texts WHERE session_id = ?
         """, [sid]).fetchall()
@@ -397,7 +458,7 @@ def _load_persisted_docs():
 def get_gap_history(limit: int = 50) -> list[dict]:
     try:
         _init_db()
-        con  = sqlite3.connect(str(DB_PATH))
+        con  = _get_conn()
         rows = con.execute("""
             SELECT doc_name, framework, status, coverage_pct,
                    recommendation, created_at
@@ -423,6 +484,7 @@ def get_gap_history(limit: int = 50) -> list[dict]:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE STORE
+# NOTE: _store() and any function that calls it must run on the main thread only.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _store() -> dict:
@@ -438,36 +500,44 @@ def _store() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FRAMEWORK LOADING
+# PARALLEL FRAMEWORK LOADING
+# Workers only do I/O + CPU (PDF extraction + chunking).
+# All st.session_state writes happen on the main thread after threads finish.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_frameworks() -> dict[str, bool]:
-    store  = _store()
-    status = {}
-    _load_persisted_docs()
+    store = _store()           # main thread
+    _load_persisted_docs()     # main thread
 
     if store["fw_loaded"]:
-        for name in FRAMEWORKS:
-            status[name] = name in store["frameworks"]
-        return status
+        return {name: name in store["frameworks"] for name in FRAMEWORKS}
 
-    for name, filename in FRAMEWORKS.items():
+    def _load_one(item: tuple) -> tuple[str, str | None, list | None]:
+        """Pure I/O + CPU — no st.* calls."""
+        name, filename = item
         fpath = DOCS_DIR / filename
         if not fpath.exists():
-            status[name] = False
-            continue
+            return name, None, None
         text = _extract_pdf(fpath)
         if not text or text.startswith("[") or len(text.strip()) < 100:
-            status[name] = False
-            continue
-        chunks = _chunk_text(text)
+            return name, None, None
+        return name, text, _chunk_text(text)
+
+    # Collect into a plain local dict — no st.session_state inside threads
+    loaded: dict[str, tuple[str, list]] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for name, text, chunks in executor.map(_load_one, FRAMEWORKS.items()):
+            if text and chunks:
+                loaded[name] = (text, chunks)
+
+    # Write to session_state on the main thread after all threads have finished
+    for name, (text, chunks) in loaded.items():
         store["frameworks"][name] = text
         store["fw_chunks"][name]  = chunks
-        status[name] = True
 
     store["fw_loaded"]   = True
-    store["load_status"] = status
-    return status
+    store["load_status"] = {name: name in store["frameworks"] for name in FRAMEWORKS}
+    return store["load_status"]
 
 
 def add_company_doc(label: str, text: str):
@@ -490,10 +560,14 @@ def company_has_docs() -> bool:
 
 def clear_company_docs():
     _store()["company"].clear()
+    # Clear in-memory gap cache
+    keys_to_clear = [k for k in st.session_state if k.startswith("gap_cache_")]
+    for k in keys_to_clear:
+        del st.session_state[k]
     try:
         _init_db()
         sid = _session_id()
-        con = sqlite3.connect(str(DB_PATH))
+        con = _get_conn()
         con.execute("DELETE FROM doc_texts WHERE session_id = ?", [sid])
         con.commit()
         con.close()
@@ -571,7 +645,7 @@ ground your answer in the provided context."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORE GAP ANALYSIS
+# CORE GAP ANALYSIS — PURE FUNCTION (no st.* calls)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _gap_analysis_single_framework(
@@ -579,16 +653,14 @@ def _gap_analysis_single_framework(
     doc_text:     str,
     fw_name:      str,
     fw_text:      str,
-    company_name: str,
-    progress_callback=None,
+    company_name: str,      # passed explicitly — never read from session state
 ) -> dict:
-    """One LLM call per framework — gaps + recommendations in one response."""
-
+    """
+    One LLM call per framework — gaps + recommendations in one response.
+    THREAD-SAFE: contains zero st.* calls. All inputs are plain Python values.
+    """
     doc_excerpt = " ".join(doc_text.split()[:DOC_EXCERPT_WORDS])
     fw_excerpt  = " ".join(fw_text.split()[:MAX_FW_WORDS])
-
-    if progress_callback:
-        progress_callback(fw_name, 1, 1)
 
     prompt = _SINGLE_PASS_PROMPT.format(
         doc_name     = doc_name,
@@ -598,7 +670,7 @@ def _gap_analysis_single_framework(
         fw_excerpt   = fw_excerpt,
     )
 
-    result = _llm_json(prompt, system=_GAP_SYSTEM, max_tokens=8000, retries=3)
+    result = _llm_json(prompt, system=_GAP_SYSTEM, max_tokens=8000, retries=1)
 
     if not result or not isinstance(result, dict):
         return {
@@ -610,18 +682,26 @@ def _gap_analysis_single_framework(
                 "clause":          "N/A",
                 "what_is_missing": "LLM returned no parseable JSON",
                 "why_it_matters":  "Analysis could not be completed",
-                "recommendation":  {},
+                "recommendation":  {
+                    "action":   "Retry the analysis",
+                    "how_to":   "Check your OpenRouter API key and model availability, then retry",
+                    "add_to":   "N/A",
+                    "priority": "High",
+                    "timeline": "Immediately",
+                },
             }],
             "recommendation": {
-                "priority": "Unknown",
-                "action":   "Retry the analysis",
-                "timeline": "Immediately",
+                "priority":                    "Unknown",
+                "action":                      "Retry the analysis",
+                "timeline":                    "Immediately",
+                "references_existing_section": "N/A",
             },
         }
 
     matched  = result.get("matched_requirements", [])
     gaps     = result.get("gaps", [])
     coverage = result.get("coverage_percent", 0)
+
     if not isinstance(coverage, (int, float)):
         coverage = 0
     coverage = round(round(int(coverage) / 5) * 5)
@@ -660,9 +740,9 @@ def _gap_analysis_single_framework(
             "90 days"
         )
         consolidated_rec = {
-            "priority":                    top_priority,
-            "action":                      "\n".join(actions),
-            "timeline":                    top_timeline,
+            "priority": top_priority,
+            "action":   "\n".join(actions),
+            "timeline": top_timeline,
             "references_existing_section": ", ".join(
                 g.get("recommendation", {}).get("add_to", "")
                 for g in gaps
@@ -696,15 +776,24 @@ def gap_analysis(doc_name: str,
                  progress_callback=None) -> list[dict] | None:
     """
     Run gap analysis for one company document against selected frameworks.
-    Uses ONE LLM call per framework, run in parallel (max 4 at a time).
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    Thread-safety strategy:
+    ─────────────────────────────────────────────────────────────────────────
+    1. ALL reads from st.session_state happen HERE, on the main Streamlit thread,
+       BEFORE the ThreadPoolExecutor is created.
+    2. Worker functions (_run_one) receive only plain Python values — no st.*
+       calls, no session_state access whatsoever.
+    3. ALL writes to st.session_state happen HERE, on the main thread,
+       AFTER all futures have completed.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    # ── Read everything from session_state NOW, on the main thread ────────────
     company = get_company_docs()
     if doc_name not in company:
         return None
 
-    if not os.getenv("OPENROUTER_API_KEY"):
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
         st.error(
             "❌ OpenRouter API key not found.\n\n"
             "Please:\n"
@@ -715,85 +804,135 @@ def gap_analysis(doc_name: str,
         return None
 
     doc_text     = company[doc_name]
-    fw_store     = _store()["frameworks"]
+    doc_hash     = hashlib.md5(doc_text.encode()).hexdigest()[:12]
+    fw_store     = _store()["frameworks"]    # main thread read
+    # Read company_name here so workers never touch session_state
     company_name = st.session_state.get("nr_company_name", "The Company")
-    results      = []
 
-    def run_one(fw_name: str) -> dict | None:
-            if fw_name not in fw_store:
-                return None
+    # ── Separate cached vs needs-LLM (main thread) ────────────────────────────
+    cached_results:  list[dict] = []
+    frameworks_todo: list[str]  = []
 
-            last_result = None
-            for attempt in range(2):  # try up to twice per framework
-                try:
-                    result = _gap_analysis_single_framework(
-                        doc_name          = doc_name,
-                        doc_text          = doc_text,
-                        fw_name           = fw_name,
-                        fw_text           = fw_store[fw_name],
-                        company_name      = company_name,
-                        progress_callback = progress_callback,
-                    )
-                    if result.get("status") != "Error":
-                        return result
-                    last_result = result
-                except Exception as e:
-                    last_result = {
-                        "framework":            fw_name,
-                        "status":               "Error",
-                        "coverage_percent":     0,
-                        "matched_requirements": [],
-                        "gaps": [{
-                            "clause":          "N/A",
-                            "what_is_missing": f"Analysis failed: {e}",
-                            "why_it_matters":  "Cannot determine compliance status",
-                            "recommendation":  {
-                                "action":   "Retry the analysis",
-                                "how_to":   "Check OpenRouter API key and retry",
-                                "add_to":   "N/A",
-                                "priority": "High",
-                                "timeline": "Immediately",
-                            },
-                        }],
-                        "recommendation": {
-                            "priority":                    "Unknown",
-                            "action":                      "Retry the analysis",
-                            "timeline":                    "Immediately",
-                            "references_existing_section": "N/A",
-                        },
-                    }
+    for fw_name in selected_frameworks:
+        cache_key = f"gap_cache_{doc_hash}_{fw_name}"
+        if cache_key in st.session_state:
+            cached_results.append(st.session_state[cache_key])
+        elif fw_name in fw_store:
+            frameworks_todo.append(fw_name)
+        else:
+            # Framework PDF not loaded — return a clear error result
+            cached_results.append({
+                "framework":            fw_name,
+                "status":               "Error",
+                "coverage_percent":     0,
+                "matched_requirements": [],
+                "gaps": [{
+                    "clause":          "N/A",
+                    "what_is_missing": f"Framework '{fw_name}' PDF not loaded",
+                    "why_it_matters":  "Cannot perform analysis without the framework document",
+                    "recommendation":  {
+                        "action":   "Place the framework PDF in neurisk/documents/ and restart",
+                        "how_to":   f"Ensure the file exists at neurisk/documents/{FRAMEWORKS.get(fw_name, '?')}",
+                        "add_to":   "N/A",
+                        "priority": "High",
+                        "timeline": "Immediately",
+                    },
+                }],
+                "recommendation": {
+                    "priority":                    "High",
+                    "action":                      "Load the missing framework PDF",
+                    "timeline":                    "Immediately",
+                    "references_existing_section": "N/A",
+                },
+            })
 
-                if attempt == 0:
-                    time.sleep(2)  # brief pause before retrying this framework
+    # ── Snapshot of fw texts needed by workers (plain dicts, no st.* ref) ─────
+    # We extract the text values now so worker closures hold no reference to
+    # st.session_state at all.
+    fw_texts_snapshot: dict[str, str] = {
+        fw_name: fw_store[fw_name]
+        for fw_name in frameworks_todo
+    }
 
-            return last_result
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(run_one, fw): fw
-            for fw in selected_frameworks
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                results.append(result)
+    # ── Worker — pure function, zero st.* calls ───────────────────────────────
+    def _run_one(fw_name: str) -> dict:
+        """Runs in a ThreadPoolExecutor worker. Must NOT touch st.*."""
+        try:
+            return _gap_analysis_single_framework(
+                doc_name     = doc_name,
+                doc_text     = doc_text,
+                fw_name      = fw_name,
+                fw_text      = fw_texts_snapshot[fw_name],
+                company_name = company_name,   # passed as a plain string
+            )
+        except Exception as e:
+            return {
+                "framework":            fw_name,
+                "status":               "Error",
+                "coverage_percent":     0,
+                "matched_requirements": [],
+                "gaps": [{
+                    "clause":          "N/A",
+                    "what_is_missing": f"Analysis failed: {e}",
+                    "why_it_matters":  "Cannot determine compliance status",
+                    "recommendation":  {
+                        "action":   "Retry the analysis",
+                        "how_to":   "Check OpenRouter API key and retry",
+                        "add_to":   "N/A",
+                        "priority": "High",
+                        "timeline": "Immediately",
+                    },
+                }],
+                "recommendation": {
+                    "priority":                    "Unknown",
+                    "action":                      "Retry the analysis",
+                    "timeline":                    "Immediately",
+                    "references_existing_section": "N/A",
+                },
+            }
 
-    # Sort results to match original selected_frameworks order
-    order = {fw: i for i, fw in enumerate(selected_frameworks)}
-    results.sort(key=lambda r: order.get(r.get("framework", ""), 999))
+    # ── Run workers ───────────────────────────────────────────────────────────
+    fresh_results: list[dict] = []
 
-    if results:
-        _save_gap_results(doc_name, results)
-    return results if results else None
+    if frameworks_todo:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(_run_one, fw): fw
+                for fw in frameworks_todo
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    fresh_results.append(result)
+
+    # ── Write cache to session_state HERE on the main thread ─────────────────
+    for result in fresh_results:
+        cache_key = f"gap_cache_{doc_hash}_{result['framework']}"
+        st.session_state[cache_key] = result
+
+    # ── Persist fresh results to SQLite (session_id read on main thread) ──────
+    if fresh_results:
+        sid = _session_id()
+        _save_gap_results(sid, doc_name, fresh_results)
+
+    # ── Merge and sort ────────────────────────────────────────────────────────
+    all_results = cached_results + fresh_results
+    order       = {fw: i for i, fw in enumerate(selected_frameworks)}
+    all_results.sort(key=lambda r: order.get(r.get("framework", ""), 999))
+
+    return all_results if all_results else None
+
+
 def compliance_chat(question: str, history: list[dict]) -> str:
     """
-    Multi-turn compliance Q&A backed by TF-IDF retrieval over framework chunks.
-    history = [{"role": "user"|"assistant", "content": "..."}]
+    Multi-turn compliance Q&A backed by semantic retrieval over framework chunks.
+    Runs on the main thread — reads from session_state are safe here.
     """
     fw_context = _retrieve_for_query(question, top_k=TOP_K_CHUNKS)
 
     co_parts = []
     for name, text in get_company_docs().items():
-        excerpt = " ".join(text.split()[:1200])
+        excerpt = " ".join(text.split()[:1500])
         co_parts.append(f"=== {name} ===\n{excerpt}")
     co_context = "\n\n".join(co_parts)
 
@@ -807,7 +946,7 @@ def compliance_chat(question: str, history: list[dict]) -> str:
     if context_block:
         conversation_parts.append(f"CONTEXT:\n{context_block}\n---")
 
-    for turn in history[-6:]:
+    for turn in history[-12:]:
         role    = turn["role"].upper()
         content = turn["content"]
         conversation_parts.append(f"{role}: {content}")
@@ -818,41 +957,16 @@ def compliance_chat(question: str, history: list[dict]) -> str:
     full_prompt = "\n\n".join(conversation_parts)
     return _llm(full_prompt, system=_CHAT_SYSTEM, max_tokens=1400)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# DEBUG
+# FULL POSTURE ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def debug_llm_test() -> dict:
-    """Call this from your Streamlit UI to diagnose the exact failure."""
-    results = {}
-    
-    key = os.getenv("OPENROUTER_API_KEY")
-    results["api_key_found"] = bool(key)
-    results["api_key_preview"] = key[:12] + "..." if key else "MISSING"
-    
-    try:
-        raw = _llm("Say hello in one word.", max_tokens=10)
-        results["basic_call"] = raw
-    except Exception as e:
-        results["basic_call"] = f"FAILED: {e}"
-    
-    try:
-        raw = _llm('Return ONLY this exact JSON, nothing else: {"test": "ok"}', max_tokens=50)
-        results["raw_json_response"] = raw
-    except Exception as e:
-        results["raw_json_response"] = f"FAILED: {e}"
-
-    fw = get_frameworks()
-    results["frameworks_loaded"] = list(fw.keys())
-    
-    co = get_company_docs()
-    results["company_docs"] = list(co.keys())
-    
-    return results
 def full_posture_analysis() -> dict[str, float]:
     """
     Aggregate coverage scores across all uploaded docs and all frameworks.
-    Returns {framework_name: average_coverage_percent}
+    Returns {framework_name: average_coverage_percent}.
+    Benefits from caching — repeated calls are near-instant.
     """
     all_docs = get_company_docs()
     fw_names = list(get_frameworks().keys())
@@ -877,3 +991,43 @@ def full_posture_analysis() -> dict[str, float]:
         for fw, scores in aggregate.items()
         if scores
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEBUG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def debug_llm_test() -> dict:
+    """Call from Streamlit UI to diagnose failures. Main thread only."""
+    results = {}
+
+    key = os.getenv("OPENROUTER_API_KEY")
+    results["api_key_found"]   = bool(key)
+    results["api_key_preview"] = key[:12] + "..." if key else "MISSING"
+    results["model_in_use"]    = OPENROUTER_MODEL
+
+    try:
+        raw = _llm("Say hello in one word.", max_tokens=10)
+        results["basic_call"] = raw
+    except Exception as e:
+        results["basic_call"] = f"FAILED: {e}"
+
+    try:
+        raw = _llm('Return ONLY this exact JSON, nothing else: {"test": "ok"}', max_tokens=50)
+        results["raw_json_response"] = raw
+    except Exception as e:
+        results["raw_json_response"] = f"FAILED: {e}"
+
+    model = _get_embed_model()
+    results["semantic_retrieval"] = (
+        "available" if model
+        else "TF-IDF fallback (pip install sentence-transformers)"
+    )
+
+    fw = get_frameworks()
+    results["frameworks_loaded"] = list(fw.keys())
+
+    co = get_company_docs()
+    results["company_docs"] = list(co.keys())
+
+    return results
